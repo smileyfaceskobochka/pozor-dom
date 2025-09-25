@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "pozor-dom-cloud",
+  "pozor-dom-hub",
+  "pozor-dom-shared"
+]
