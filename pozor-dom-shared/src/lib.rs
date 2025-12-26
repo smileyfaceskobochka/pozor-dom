@@ -1,9 +1,16 @@
 // Shared constants and utilities for Pozor-dom
 
+pub mod dashboard;
+
+#[cfg(feature = "server")]
 use std::collections::HashMap;
+#[cfg(feature = "server")]
 use std::net::SocketAddr;
+#[cfg(feature = "server")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "server")]
 use tokio::io::AsyncBufReadExt;
+#[cfg(feature = "server")]
 use tokio::sync::mpsc;
 
 // Ports
@@ -28,10 +35,13 @@ pub fn hub_url() -> String {
 }
 
 // Common types
+#[cfg(feature = "server")]
 pub type Tx = mpsc::UnboundedSender<tokio_tungstenite::tungstenite::protocol::Message>;
+#[cfg(feature = "server")]
 pub type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
 // Message handling utilities
+#[cfg(feature = "server")]
 pub mod messages {
     use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -74,6 +84,7 @@ pub mod messages {
 }
 
 // Connection management utilities
+#[cfg(feature = "server")]
 pub mod connection {
     use super::*;
     use std::io;

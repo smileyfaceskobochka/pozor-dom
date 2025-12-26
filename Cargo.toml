@@ -3,5 +3,8 @@ members = [
   "pozor-dom-cloud",
   "pozor-dom-hub",
   "pozor-dom-client",
-  "pozor-dom-shared"
+  "pozor-dom-shared",
+  "pozor-dom-device",
+  "tests"
 ]
+resolver = "3"

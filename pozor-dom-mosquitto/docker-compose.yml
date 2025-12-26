@@ -1,0 +1,30 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: pozor-dom-mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-logs:/mosquitto/log
+    environment:
+      - TZ=UTC
+    healthcheck:
+      test: mosquitto_sub -h localhost -t '$$SYS/#' -C 1 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pozor-dom-network
+
+volumes:
+  mosquitto-data:
+    driver: local
+  mosquitto-logs:
+    driver: local
+
+networks:
+  pozor-dom-network:
+    driver: bridge

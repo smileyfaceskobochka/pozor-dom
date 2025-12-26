@@ -1,257 +1,331 @@
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::protocol::Message};
-use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use pozor_dom_shared::{cloud_url_with_host, config, connection, logging, messages, PeerMap, Tx};
-use std::env;
+mod mqtt;
+mod websocket;
+mod database;
+
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex, mpsc};
+use tokio::task::JoinHandle;
+use pozor_dom_shared::dashboard;
+use warp::Filter;
+
+#[derive(Debug)]
+enum CloudCommand {
+    Connect,
+    Disconnect,
+}
 
 #[tokio::main]
-async fn main() {
-    let args: Vec<String> = env::args().collect();
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("🚀 Позор-дом Hub starting...");
+    println!("Local network server + Cloud relay + MQTT bridge + Web Dashboard");
+    println!("Press Ctrl+C to exit.\n");
 
+    let args: Vec<String> = std::env::args().collect();
     let cloud_host = if args.len() > 1 {
-        args[1].clone()
+        args[1].as_str()
     } else {
-        config::get_cloud_host()
+        "127.0.0.1"
     };
 
-    println!("Pozor-dom Hub starting...");
-    println!("Local network server + Cloud relay. Type messages to broadcast to all clients (local + cloud). Press Ctrl+C to exit.");
-    println!("Usage: {} [cloud_host] (default: {})", args[0], config::get_cloud_host());
+    // Initialize SQLite database
+    let db = Arc::new(database::Database::new("pozor_dom_hub.db")?);
+    println!("💾 Database initialized: pozor_dom_hub.db");
 
-    let addr = format!("127.0.0.1:{}", pozor_dom_shared::HUB_PORT);
-    let listener = TcpListener::bind(&addr).await.expect("Can't listen");
-    println!("Hub WebSocket server listening on: {}", addr);
-    println!("Note: This is using plain WebSocket (ws://), not WSS yet.");
-    println!("For production WSS, you'll need to add TLS certificates.");
+    // Load cloud enabled state from database
+    let cloud_enabled = db.get_cloud_enabled().unwrap_or(true);
+    println!("🌐 Cloud connectivity: {}", if cloud_enabled { "enabled" } else { "disabled" });
 
-    let peer_map = connection::create_peer_map();
+    // Broadcast channel for messages
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(100);
+    let tx = Arc::new(tx);
 
-    // Connect to Cloud server for relaying messages
-    let cloud_url = cloud_url_with_host(&cloud_host);
-    println!("Connecting to Cloud at: {} for message relaying...", cloud_url);
+    // Hub state for web dashboard (load initial devices from database)
+    let initial_devices = db.load_devices().unwrap_or_default();
+    let mut hub_state = dashboard::HubState::new("Hub");
+    hub_state.cloud_enabled = cloud_enabled; // Set initial cloud state
+    for (_device_id, telemetry) in initial_devices {
+        hub_state.update_device(telemetry);
+    }
+    let hub_state = Arc::new(Mutex::new(hub_state));
 
-    let mut rx = connection::setup_stdin_channel().await.expect("Failed to setup stdin channel");
+    // Channel for controlling cloud connection
+    let (cloud_tx, cloud_rx) = mpsc::unbounded_channel::<CloudCommand>();
 
-    // Channel for forwarding cloud messages to local clients
-    let (cloud_msg_tx, mut cloud_msg_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    // Setup MQTT client
+    let (mqtt_client, eventloop) = mqtt::setup_mqtt_client().await;
+    let mqtt_client = Arc::new(mqtt_client);
 
-    // Channel for sending messages to cloud
-    let (cloud_send_tx, mut cloud_send_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Clone for telemetry processing
+    let hub_state_mqtt = Arc::clone(&hub_state);
+    let tx_mqtt = Arc::clone(&tx);
+    let db_mqtt = Arc::clone(&db);
 
-    // Connect to Cloud server for relaying messages
-    let cloud_connection_result = connect_async(cloud_url.clone()).await;
+    // Spawn MQTT listener for telemetry
+    tokio::spawn(async move {
+        listen_and_process_telemetry(eventloop, tx_mqtt, hub_state_mqtt, db_mqtt).await;
+    });
 
-    // Handle cloud connection messages
-    match cloud_connection_result {
-        Ok((mut cloud_stream, _)) => {
-            println!("Connected to Cloud successfully for relaying!");
-            let cloud_msg_tx_clone = cloud_msg_tx.clone();
+    // Spawn cloud connection manager
+    let tx_cloud_manager = Arc::clone(&tx);
+    let cloud_url = format!("ws://{}:{}", cloud_host, 8081);
+    let cloud_url_clone = cloud_url.clone();
+    tokio::spawn(async move {
+        manage_cloud_connection(cloud_rx, cloud_url, tx_cloud_manager).await;
+    });
 
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        // Receive messages from cloud
-                        message = cloud_stream.next() => {
-                            match message {
-                                Some(Ok(Message::Text(text))) => {
-                                    // Log messages received from cloud
-                                    println!("Received from Cloud: {}", text);
-
-                                    // Forward hub broadcasts to local clients
-                                    if messages::is_hub_broadcast(&text) {
-                                        let broadcast_content = messages::extract_hub_broadcast(&text);
-                                        let hub_msg = messages::create_hub_message(broadcast_content);
-                                        if let Err(e) = cloud_msg_tx_clone.send(hub_msg) {
-                                            eprintln!("Failed to forward hub broadcast to local clients: {}", e);
-                                        }
-                                    }
-                                }
-                                Some(Ok(Message::Close(_))) => {
-                                    println!("Cloud connection closed");
-                                    break;
-                                }
-                                Some(Ok(other)) => {
-                                    println!("Received non-text message from Cloud: {:?}", other);
-                                }
-                                Some(Err(e)) => {
-                                    eprintln!("Error receiving from cloud: {}", e);
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-
-                        // Send messages to cloud
-                        msg_to_send = cloud_send_rx.recv() => {
-                            if let Some(msg) = msg_to_send {
-                                if let Err(e) = cloud_stream.send(Message::Text(msg.into())).await {
-                                    eprintln!("Failed to send to cloud: {}", e);
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        Err(e) => {
-            eprintln!("Failed to connect to Cloud: {}. Hub will work in local-only mode.", e);
-        }
+    // If cloud should be enabled initially, send connect command
+    if cloud_enabled {
+        let _ = cloud_tx.send(CloudCommand::Connect);
+        println!("🌐 Cloud relay enabled: {}", cloud_url_clone);
+    } else {
+        println!("🌐 Cloud relay disabled - local network only");
     }
 
-    // Main loop to handle new connections, cloud messages, and stdin input
+    // Start WebSocket server
+    let tx_ws = Arc::clone(&tx);
+    let mqtt_ws = Arc::clone(&mqtt_client);
+    tokio::spawn(async move {
+        if let Err(e) = websocket::start_websocket_server(tx_ws, mqtt_ws).await {
+            eprintln!("WebSocket server error: {}", e);
+        }
+    });
+
+    // Start web dashboard server with database support
+    let hub_state_web = Arc::clone(&hub_state);
+    let db_web = Arc::clone(&db);
+    let cloud_tx_web = cloud_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_web_server_with_db(hub_state_web, db_web, cloud_tx_web, 3000).await {
+            eprintln!("Web server error: {}", e);
+        }
+    });
+
+    println!("🔌 MQTT broker: 127.0.0.1:1883");
+    println!("🌐 Web dashboard: http://localhost:3000\n");
+
+    // Keep main thread alive
+    tokio::signal::ctrl_c().await?;
+    println!("\n👋 Hub shutting down...");
+
+    Ok(())
+}
+
+async fn listen_and_process_telemetry(
+    eventloop: rumqttc::EventLoop,
+    broadcast_tx: Arc<broadcast::Sender<String>>,
+    hub_state: Arc<Mutex<dashboard::HubState>>,
+    db: Arc<database::Database>,
+) {
+    use rumqttc::{Event, Incoming};
+
+    let mut eventloop = eventloop;
+
     loop {
-        tokio::select! {
-            // Handle new local connections
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, addr)) => {
-                        let peer_map = peer_map.clone();
-                        tokio::spawn(async move {
-                            println!("New local connection from: {}", addr);
-                            handle_local_connection(peer_map, stream, addr).await;
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to accept local connection: {}", e);
-                    }
-                }
-            }
+        match eventloop.poll().await {
+            Ok(notification) => {
+                match notification {
+                    Event::Incoming(Incoming::Publish(publish)) => {
+                        if let Ok(payload) = std::str::from_utf8(&publish.payload) {
+                            println!("📡 Received MQTT telemetry on {}: {}", publish.topic, payload);
 
-            // Handle cloud messages
-            cloud_msg = cloud_msg_rx.recv() => {
-                if let Some(msg) = cloud_msg {
-                    // Broadcast hub messages from cloud to local clients
-                    let peers = peer_map.lock().unwrap().clone();
-                    for (addr, tx) in peers {
-                        if let Err(e) = tx.send(msg.clone()) {
-                            eprintln!("Failed to send cloud message to local client {}: {}", addr, e);
-                        }
-                    }
-                }
-            }
+                            // Try to parse as device telemetry and update hub state
+                            match serde_json::from_str::<pozor_dom_shared::dashboard::lib::DeviceTelemetry>(payload) {
+                                Ok(telemetry) => {
+                                    println!("✅ Successfully parsed telemetry for device: {}", telemetry.device_id);
 
-            // Handle stdin input
-            input = rx.recv() => {
-                match input {
-                    Some(text) => {
-                        logging::log_broadcast(&text, "Hub");
+                                    // Save to database (blocking operation within async context)
+                                    let db_clone = Arc::clone(&db);
+                                    let telemetry_clone = telemetry.clone();
+                                    tokio::task::block_in_place(|| {
+                                        if let Err(e) = db_clone.save_device(&telemetry_clone) {
+                                            eprintln!("❌ Failed to save device to database: {}", e);
+                                        }
+                                    });
 
-                        // Broadcast to local clients
-                        let peers = peer_map.lock().unwrap().clone();
-                        for (addr, tx) in peers {
-                            if let Err(e) = tx.send(messages::create_hub_message(&text)) {
-                                eprintln!("Failed to send to local client {}: {}", addr, e);
+                                    // Update in-memory state
+                                    let mut state = hub_state.lock().await;
+                                    state.update_device(telemetry);
+                                }
+                                Err(e) => {
+                                    println!("❌ Failed to parse telemetry payload: {} (error: {})", payload, e);
+                                }
                             }
-                        }
 
-                        // Send to cloud for relaying to cloud clients
-                        let relay_msg = messages::create_hub_broadcast(&text);
-                        if let Err(e) = cloud_send_tx.send(relay_msg) {
-                            eprintln!("Failed to send to cloud: {}", e);
+                            // Broadcast telemetry to all WebSocket clients
+                            let _ = broadcast_tx.send(payload.to_string());
                         }
                     }
-                    None => break,
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ MQTT telemetry listener error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn manage_cloud_connection(
+    mut rx: mpsc::UnboundedReceiver<CloudCommand>,
+    cloud_url: String,
+    broadcast_tx: Arc<broadcast::Sender<String>>,
+) {
+    let mut current_task: Option<JoinHandle<()>> = None;
+
+    while let Some(command) = rx.recv().await {
+        match command {
+            CloudCommand::Connect => {
+                // If already connected, do nothing
+                if current_task.is_some() {
+                    continue;
+                }
+
+                println!("🌐 Connecting to cloud: {}", cloud_url);
+                let tx_clone = Arc::clone(&broadcast_tx);
+                let url_clone = cloud_url.clone();
+
+                let task = tokio::spawn(async move {
+                    if let Err(e) = websocket::connect_to_cloud(&url_clone, tx_clone).await {
+                        eprintln!("Cloud connection error: {}", e);
+                    }
+                });
+
+                current_task = Some(task);
+            }
+            CloudCommand::Disconnect => {
+                // If connected, abort the task
+                if let Some(task) = current_task.take() {
+                    task.abort();
+                    println!("🌐 Disconnected from cloud");
                 }
             }
         }
     }
 }
 
-async fn handle_local_connection(peer_map: PeerMap, raw_stream: tokio::net::TcpStream, addr: SocketAddr) {
-    match accept_async(raw_stream).await {
-        Ok(ws_stream) => {
-            logging::log_connection(&addr, "Hub");
+async fn start_web_server_with_db(
+    hub_state: Arc<Mutex<dashboard::HubState>>,
+    db: Arc<database::Database>,
+    cloud_tx: mpsc::UnboundedSender<CloudCommand>,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let hub_state_filter = warp::any().map(move || Arc::clone(&hub_state));
+    let db_for_toggle = Arc::clone(&db);
+    let db_filter = warp::any().map(move || Arc::clone(&db));
 
-            // Create channels for this peer
-            let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-            peer_map.lock().unwrap().insert(addr, tx);
+    // Serve Yew-based dashboard instead of static HTML
+    let dashboard = warp::path::end()
+        .map(move || {
+            let html_content = include_str!("../../pozor-dom-shared/src/dashboard/yew_index.html");
+            warp::reply::html(html_content)
+        });
 
-            let (mut write, mut read) = ws_stream.split();
-
-            // Send welcome message
-            let welcome_msg = messages::create_welcome_message("Hub");
-            if let Err(e) = write.send(welcome_msg).await {
-                eprintln!("Failed to send welcome message: {}", e);
-                peer_map.lock().unwrap().remove(&addr);
-                return;
-            }
-
-            // Handle incoming messages
-            loop {
-                tokio::select! {
-                    // Handle incoming WebSocket messages
-                    message = read.next() => {
-                        match message {
-                            Some(Ok(Message::Text(text))) => {
-                                logging::log_message_received(&addr, &text);
-
-                                // Collect broadcast recipients (release lock immediately)
-                                let broadcast_recipients: Vec<Tx> = {
-                                    let peers = peer_map.lock().unwrap();
-                                    peers.iter()
-                                        .filter(|(peer_addr, _)| *peer_addr != &addr)
-                                        .map(|(_, tx)| tx.clone())
-                                        .collect()
-                                };
-
-                                // Broadcast to all other peers
-                                let broadcast_msg = format!("[{}] {}", addr, text);
-                                for recipient in broadcast_recipients {
-                                    if let Err(e) = recipient.send(Message::Text(broadcast_msg.clone().into())) {
-                                        eprintln!("Failed to send to peer: {}", e);
-                                    }
-                                }
-
-                                // Only echo back if this is not a response message (to prevent infinite loop)
-                                if !messages::is_response_message(&text) {
-                                    // Echo back to sender
-                                    let echo_msg = messages::create_echo_message("Hub", &text);
-                                    if let Err(e) = write.send(echo_msg).await {
-                                        eprintln!("Failed to send response: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            Some(Ok(Message::Close(_))) => {
-                                println!("Connection closed by: {}", addr);
-                                break;
-                            }
-                            Some(Ok(other)) => {
-                                println!("Received non-text message from {}: {:?}", addr, other);
-                            }
-                            Some(Err(e)) => {
-                                eprintln!("Error from {}: {}", addr, e);
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-
-                    // Handle messages to send to this peer
-                    message = rx.recv() => {
-                        match message {
-                            Some(msg) => {
-                                if let Err(e) = write.send(msg).await {
-                                    eprintln!("Failed to send message to {}: {}", addr, e);
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
+    // API endpoints that use database (synchronous)
+    let api_devices = warp::path!("api" / "devices")
+        .and(db_filter.clone())
+        .map(|db: Arc<database::Database>| {
+            // Hub always has access to its database
+            match db.load_devices() {
+                Ok(devices) => {
+                    let device_list: Vec<&pozor_dom_shared::dashboard::lib::DeviceTelemetry> = devices.values().collect();
+                    warp::reply::with_status(warp::reply::json(&device_list), warp::http::StatusCode::OK)
+                }
+                Err(e) => {
+                    eprintln!("Database error loading devices: {}", e);
+                    // Return empty array on error
+                    warp::reply::with_status(warp::reply::json(&Vec::<&pozor_dom_shared::dashboard::lib::DeviceTelemetry>::new()), warp::http::StatusCode::INTERNAL_SERVER_ERROR)
                 }
             }
+        });
 
-            // Clean up
-            peer_map.lock().unwrap().remove(&addr);
-            println!("Connection with {} closed", addr);
-        }
-        Err(e) => {
-            eprintln!("Failed to accept WebSocket connection from {}: {}", addr, e);
-        }
+    let api_messages = warp::path!("api" / "messages")
+        .and(hub_state_filter.clone())
+        .and_then(get_messages);
+
+    let cloud_tx_filter = warp::any().map(move || cloud_tx.clone());
+    let db_filter_for_toggle = warp::any().map(move || Arc::clone(&db_for_toggle));
+
+    let api_toggle_cloud = warp::path!("api" / "toggle-cloud")
+        .and(warp::post())
+        .and(hub_state_filter.clone())
+        .and(cloud_tx_filter)
+        .and(db_filter_for_toggle)
+        .and_then(toggle_cloud);
+
+
+
+    let routes = dashboard
+        .or(api_devices)
+        .or(api_messages)
+        .or(api_toggle_cloud)
+        .with(warp::cors().allow_any_origin());
+
+    println!("🌐 Web dashboard available at: http://localhost:{}", port);
+    warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+
+    Ok(())
+}
+
+
+
+async fn get_messages_protected(
+    hub_state: Arc<Mutex<dashboard::HubState>>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let state = hub_state.lock().await;
+
+    // Check if cloud access is allowed
+    if !state.cloud_enabled {
+        // Cloud is disabled, return forbidden
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "error": "Cloud access disabled",
+                "message": "Cloud connectivity is currently disabled on this hub"
+            })),
+            warp::http::StatusCode::FORBIDDEN
+        ));
     }
+
+    Ok(warp::reply::with_status(warp::reply::json(&state.messages), warp::http::StatusCode::OK))
+}
+
+async fn get_messages(
+    hub_state: Arc<Mutex<dashboard::HubState>>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let state = hub_state.lock().await;
+    Ok(warp::reply::json(&state.messages))
+}
+
+async fn toggle_cloud(
+    hub_state: Arc<Mutex<dashboard::HubState>>,
+    cloud_tx: mpsc::UnboundedSender<CloudCommand>,
+    db: Arc<database::Database>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let mut state = hub_state.lock().await;
+    let was_enabled = state.cloud_enabled;
+    state.toggle_cloud();
+    let is_now_enabled = state.cloud_enabled;
+
+    // Persist the new state to database
+    let db_clone = Arc::clone(&db);
+    let enabled_value = is_now_enabled;
+    tokio::task::block_in_place(|| {
+        if let Err(e) = db_clone.set_cloud_enabled(enabled_value) {
+            eprintln!("Failed to persist cloud enabled state: {}", e);
+        }
+    });
+
+    // Control the cloud connection
+    if !was_enabled && is_now_enabled {
+        // Was disabled, now enabled - connect
+        let _ = cloud_tx.send(CloudCommand::Connect);
+    } else if was_enabled && !is_now_enabled {
+        // Was enabled, now disabled - disconnect
+        let _ = cloud_tx.send(CloudCommand::Disconnect);
+    }
+
+    Ok(warp::reply::json(&serde_json::json!({
+        "cloud_enabled": is_now_enabled,
+        "message": format!("Cloud {} for {}", if is_now_enabled { "enabled" } else { "disabled" }, state.service_name)
+    })))
 }

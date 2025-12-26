@@ -3,7 +3,77 @@ name = "pozor-dom-shared"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1.0", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", optional = true }
+warp = { version = "0.3", optional = true }
+yew = { version = "0.21", features = ["csr"], optional = true }
+yew-router = { version = "0.18", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = [
+  "console",
+  "Window",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "Node",
+  "Text",
+  "HtmlCollection",
+  "DomTokenList",
+  "CssStyleDeclaration",
+  "EventTarget",
+  "Event",
+  "KeyboardEvent",
+  "MouseEvent",
+  "FocusEvent",
+  "InputEvent",
+  "WheelEvent",
+  "CompositionEvent",
+  "ClipboardEvent",
+  "TouchEvent",
+  "DragEvent",
+  "ErrorEvent",
+  "PointerEvent",
+  "AnimationEvent",
+  "TransitionEvent",
+  "MessageEvent",
+  "WebSocket",
+  "CloseEvent",
+  "BinaryType",
+  "Blob",
+  "File",
+  "FileList",
+  "FileReader",
+  "FormData",
+  "ProgressEvent",
+  "XmlHttpRequest",
+  "XmlHttpRequestEventTarget",
+  "XmlHttpRequestUpload",
+  "Headers",
+  "Request",
+  "RequestInit",
+  "RequestMode",
+  "Response",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "AbortController",
+  "AbortSignal",
+  "HtmlSelectElement",
+], optional = true }
+js-sys = { version = "0.3", optional = true }
+gloo = { version = "0.10", optional = true }
+gloo-net = { version = "0.4", optional = true }
+log = "0.4"
+
+[features]
+default = ["server"]
+server = ["tokio", "tokio-tungstenite", "chrono", "warp", "yew", "yew-router", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "js-sys", "gloo", "gloo-net"]
+wasm = ["yew", "yew-router", "wasm-bindgen", "wasm-bindgen-futures", "web-sys", "js-sys", "gloo", "gloo-net"]

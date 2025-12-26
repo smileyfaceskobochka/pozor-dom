@@ -1,15 +1,20 @@
 [package]
-name = "pozor-dom-cloud"
+name = "pozor-dom-tests"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "pozor_dom_tests"
+path = "integration_tests.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+rumqttc = "0.24"
+tokio-tungstenite = "0.28"
 futures-util = "0.3"
-pozor-dom-shared = { path = "../pozor-dom-shared" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
-warp = "0.3"
-bytes = "1.0"
+chrono = "0.4"
+futures = "0.3"
+pozor-dom-shared = { path = "../pozor-dom-shared" }
